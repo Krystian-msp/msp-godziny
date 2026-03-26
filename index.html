@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="pl">
 <head>
@@ -451,7 +450,7 @@ const MSAL_CONFIG = {
   },
   cache: { cacheLocation: "localStorage", storeAuthStateInCookie: false }
 };
-const SCOPES = ["User.Read", "Files.ReadWrite"];
+const SCOPES = ["User.Read", "Files.ReadWrite", "Sites.ReadWrite.All"];
 const msalApp = new msal.PublicClientApplication(MSAL_CONFIG);
 let msToken = null;
 let excelFileId = null;
@@ -535,34 +534,70 @@ async function graphPost(path, body) {
   return r.json();
 }
 
+// ── SHAREPOINT CONFIG ────────────────────────────────────────────────
+// SharePoint MSP Project — Shared Documents
+const SP_HOSTNAME = 'mspproject.sharepoint.com';
+const SP_SITE_PATH = '/sites/mspproject.pl';
+const SP_SITE_URL = 'https://' + SP_HOSTNAME + SP_SITE_PATH;
+const EXCEL_FILENAME = 'Godziny_Pracowników.xlsx';
+
 // ── FIND EXCEL FILE & LOAD PROJECTS FROM EXCEL ──────────────────────
 async function findExcelFile() {
   const token = getToken();
   if (!token) return;
 
-  // Szukaj pliku Godziny_Pracowników na OneDrive admina
   try {
-    const search = await graphGet("/me/drive/root/search(q='Godziny_Pracow')");
+    // Get SharePoint site ID
+    const site = await graphGet('/sites/' + SP_HOSTNAME + ':' + SP_SITE_PATH);
+    const siteId = site.id;
+    console.log('SharePoint site ID:', siteId);
+
+    // Get default document library (Shared Documents)
+    const drives = await graphGet('/sites/' + siteId + '/drives');
+    const docLib = (drives.value || []).find(d =>
+      d.name === 'Shared Documents' || d.name === 'Dokumenty' || d.driveType === 'documentLibrary'
+    ) || (drives.value || [])[0];
+
+    if (!docLib) { console.warn('Nie znaleziono biblioteki dokumentów'); return; }
+    console.log('Drive:', docLib.name, docLib.id);
+
+    // Search for Excel file in SharePoint
+    const search = await graphGet('/drives/' + docLib.id + '/root/search(q='Godziny_Pracow')');
     const files = search.value || [];
-    const file = files.find(f => f.name && (
-      f.name.includes('Godziny_Pracow') || f.name.includes('Godziny Pracow')
-    ));
+    const file = files.find(f => f.name && f.name.includes('Godziny_Pracow'));
+
     if (file) {
       excelFileId = file.id;
+      // Store drive ID for later use in append/ensure functions
+      window._spDriveId = docLib.id;
       console.log('Znaleziono plik:', file.name, 'ID:', file.id);
       await loadProjectsFromExcel();
       return;
     }
-  } catch(e) { console.warn('Szukanie pliku:', e); }
 
-  console.warn('Nie znaleziono pliku Excel — używam danych wbudowanych');
+    // File not found — upload the template to SharePoint
+    console.warn('Nie znaleziono pliku Excel w SharePoint — plik musi być wgrany ręcznie do Shared Documents');
+    toast('Uwaga: wgraj plik Godziny_Pracowników.xlsx do SharePoint → Shared Documents');
+  } catch(e) {
+    console.warn('Błąd SharePoint:', e.message);
+    // Fallback to personal OneDrive
+    try {
+      const search = await graphGet("/me/drive/root/search(q='Godziny_Pracow')");
+      const file = (search.value || []).find(f => f.name && f.name.includes('Godziny_Pracow'));
+      if (file) {
+        excelFileId = file.id;
+        window._spDriveId = null; // personal OneDrive, no custom drive
+        await loadProjectsFromExcel();
+      }
+    } catch(e2) { console.warn('Błąd fallback OneDrive:', e2.message); }
+  }
 }
 
 async function loadProjectsFromExcel() {
   if (!excelFileId) return;
   try {
     // Pobierz listę kart żeby znaleźć kartę z projektami
-    const sheets = await graphGet(`/me/drive/items/${excelFileId}/workbook/worksheets`);
+    const sheets = await graphGet(driveItemPath(excelFileId) + '/workbook/worksheets');
     const sheetNames = (sheets.value || []).map(s => s.name);
     console.log('Karty w pliku:', sheetNames);
 
@@ -574,7 +609,7 @@ async function loadProjectsFromExcel() {
     if (!projSheet) return;
 
     const range = await graphGet(
-      `/me/drive/items/${excelFileId}/workbook/worksheets('${encodeURIComponent(projSheet)}')/usedRange`
+      driveItemPath(excelFileId) + '/workbook/worksheets(\'' + encodeURIComponent(projSheet) + ''')/usedRange'
     );
     const values = range.values || [];
     if (!values.length) return;
@@ -617,15 +652,23 @@ async function loadProjectsFromExcel() {
 }
 
 // ── ENSURE WORKER SHEET ───────────────────────────────────────────────
+function driveItemPath(fileId) {
+  // Use SharePoint drive path if available, otherwise personal OneDrive
+  if (window._spDriveId) {
+    return '/drives/' + window._spDriveId + '/items/' + fileId;
+  }
+  return '/me/drive/items/' + fileId;
+}
+
 async function ensureWorkerSheet(workerName) {
   if (!getToken() || !excelFileId) return;
   const sheetName = workerName.slice(0, 31);
-  const sheets = await graphGet(`/me/drive/items/${excelFileId}/workbook/worksheets`);
+  const sheets = await graphGet(driveItemPath(excelFileId) + '/workbook/worksheets');
   const exists = (sheets.value || []).some(s => s.name === sheetName);
   if (!exists) {
-    await graphPost(`/me/drive/items/${excelFileId}/workbook/worksheets`, { name: sheetName });
+    await graphPost(driveItemPath(excelFileId) + '/workbook/worksheets', { name: sheetName });
     await graphPatch(
-      `/me/drive/items/${excelFileId}/workbook/worksheets('${encodeURIComponent(sheetName)}')/range(address='A1:E1')`,
+      driveItemPath(excelFileId) + '/workbook/worksheets('' + encodeURIComponent(sheetName) + '')/range(address='A1:E1')',
       { values: [["Data", "Dzień tygodnia", "Projekt", "Etap", "Godziny"]], format: { font: { bold: true } } }
     );
   }
@@ -637,13 +680,13 @@ async function appendToExcel(workerName, date, entries) {
   const sheetName = workerName.slice(0, 31);
   await ensureWorkerSheet(workerName);
   const sheet = encodeURIComponent(sheetName);
-  const used = await graphGet(`/me/drive/items/${excelFileId}/workbook/worksheets('${sheet}')/usedRange`);
+  const used = await graphGet(driveItemPath(excelFileId) + '/workbook/worksheets('' + sheet + '')/usedRange');
   const nextRow = used.rowCount + 1;
   const d = new Date(date + 'T00:00:00');
   const dayName = DAYS_PL_FULL[d.getDay()];
   const rows = entries.map(e => [date, dayName, e.project, e.stage || "", parseFloat(e.hours)]);
   await graphPatch(
-    `/me/drive/items/${excelFileId}/workbook/worksheets('${sheet}')/range(address='A${nextRow}:E${nextRow + rows.length - 1}')`,
+    driveItemPath(excelFileId) + '/workbook/worksheets('' + sheet + '')/range(address='A' + nextRow + ':E' + (nextRow + rows.length - 1) + '')',
     { values: rows }
   );
 }
@@ -1047,7 +1090,7 @@ const MSAL_CONFIG = {
   cache: { cacheLocation: "localStorage", storeAuthStateInCookie: false }
 };
 
-const SCOPES = ["User.Read", "Files.ReadWrite"];
+const SCOPES = ["User.Read", "Files.ReadWrite", "Sites.ReadWrite.All"];
 const EXCEL_FILENAME = "Godziny_Pracow ników.xlsx";
 
 const msalApp = new msal.PublicClientApplication(MSAL_CONFIG);
@@ -1195,7 +1238,7 @@ async function createExcelFile() {
 async function ensureWorkerSheet(workerName) {
   if (!msToken || !excelFileId) return;
   try {
-    const sheets = await graphGet(`/me/drive/items/${excelFileId}/workbook/worksheets`);
+    const sheets = await graphGet(driveItemPath(excelFileId) + '/workbook/worksheets');
     const sheetNames = (sheets.value || []).map(s => s.name);
     
     // Karta nazywa się tak samo jak pracownik (max 31 znaków — limit Excel)
