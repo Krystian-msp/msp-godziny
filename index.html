@@ -539,7 +539,7 @@ async function graphPost(path, body) {
 const SP_HOSTNAME = 'mspproject.sharepoint.com';
 const SP_SITE_PATH = '/sites/mspproject.pl';
 const SP_SITE_URL = 'https://' + SP_HOSTNAME + SP_SITE_PATH;
-const EXCEL_FILENAME = 'Godziny_Pracowników.xlsx';
+const EXCEL_FILENAME = 'Godziny Pracowników.xlsx';
 
 // ── FIND EXCEL FILE & LOAD PROJECTS FROM EXCEL ──────────────────────
 async function findExcelFile() {
@@ -562,9 +562,9 @@ async function findExcelFile() {
     console.log('Drive:', docLib.name, docLib.id);
 
     // Search for Excel file in SharePoint
-    const search = await graphGet("/drives/" + docLib.id + "/root/search(q='Godziny_Pracow')");
+    const search = await graphGet("/drives/" + docLib.id + "/root/search(q='Godziny Pracow')");
     const files = search.value || [];
-    const file = files.find(f => f.name && f.name.includes('Godziny_Pracow'));
+    const file = files.find(f => f.name && f.name.toLowerCase().includes('godziny pracow'));
 
     if (file) {
       excelFileId = file.id;
@@ -577,13 +577,13 @@ async function findExcelFile() {
 
     // File not found — upload the template to SharePoint
     console.warn('Nie znaleziono pliku Excel w SharePoint — plik musi być wgrany ręcznie do Shared Documents');
-    toast('Uwaga: wgraj plik Godziny_Pracowników.xlsx do SharePoint → Shared Documents');
+    toast('Uwaga: wgraj plik "Godziny Pracowników.xlsx" do SharePoint → Shared Documents');
   } catch(e) {
     console.warn('Błąd SharePoint:', e.message);
     // Fallback to personal OneDrive
     try {
-      const search = await graphGet("/me/drive/root/search(q='Godziny_Pracow')");
-      const file = (search.value || []).find(f => f.name && f.name.includes('Godziny_Pracow'));
+      const search = await graphGet("/me/drive/root/search(q='Godziny Pracow')");
+      const file = (search.value || []).find(f => f.name && f.name.toLowerCase().includes('godziny pracow'));
       if (file) {
         excelFileId = file.id;
         window._spDriveId = null; // personal OneDrive, no custom drive
@@ -601,42 +601,41 @@ async function loadProjectsFromExcel() {
     const sheetNames = (sheets.value || []).map(s => s.name);
     console.log('Karty w pliku:', sheetNames);
 
-    // Znajdź kartę z projektami (szuka "projekt" w nazwie, case-insensitive)
+    // Znajdź kartę "lista projektów"
     const projSheet = sheetNames.find(n =>
-      n.toLowerCase().includes('projekt') || n.toLowerCase().includes('lista')
+      n.toLowerCase().includes('lista') || n.toLowerCase().includes('projekt')
     ) || sheetNames[0];
 
     if (!projSheet) return;
 
     const range = await graphGet(
-      driveItemPath(excelFileId) + '/workbook/worksheets(\'' + encodeURIComponent(projSheet) + '\')/usedRange'
+      driveItemPath(excelFileId) + "/workbook/worksheets('" + encodeURIComponent(projSheet) + "')/usedRange"
     );
     const values = range.values || [];
     if (!values.length) return;
 
-    // Parsuj: col0=nr, col1=nazwa projektu, col2=etap
+    // Struktura: col A = nazwa projektu (tylko w pierwszym wierszu grupy), col B = etap
+    // Projekty oddzielone ramkami (mogą być puste wiersze między nimi)
     const parsed = {};
     let currentProject = null;
 
     for (let r = 0; r < values.length; r++) {
       const row = values[r];
-      const num  = row[0];
-      const proj = row[1] ? String(row[1]).trim() : '';
-      const etap = row[2] ? String(row[2]).trim() : '';
+      const proj = row[0] !== null && row[0] !== undefined ? String(row[0]).trim() : '';
+      const etap = row[1] !== null && row[1] !== undefined ? String(row[1]).trim() : '';
 
-      // Pomiń nagłówek i puste wiersze
-      if (!proj || proj.toLowerCase() === 'projekty') continue;
+      // Pomiń wiersz nagłówka i całkowicie puste wiersze
+      if (!proj && !etap) { currentProject = null; continue; }
+      if (proj.toLowerCase() === 'projekt' || proj.toLowerCase() === 'projekty') continue;
 
-      // Nowy projekt — ma numer w col0
-      if (num !== null && num !== '' && !isNaN(parseFloat(String(num)))) {
+      // Jeśli col A ma wartość — nowy projekt
+      if (proj) {
         currentProject = proj;
         if (!parsed[currentProject]) parsed[currentProject] = [];
-        if (etap) parsed[currentProject].push(etap);
+        if (etap && !parsed[currentProject].includes(etap)) parsed[currentProject].push(etap);
       } else if (currentProject && etap) {
-        // Kolejny etap tego samego projektu
-        if (!parsed[currentProject].includes(etap)) {
-          parsed[currentProject].push(etap);
-        }
+        // Col A pusta, col B ma etap — kolejny etap bieżącego projektu
+        if (!parsed[currentProject].includes(etap)) parsed[currentProject].push(etap);
       }
     }
 
